@@ -1,6 +1,3 @@
-# Copyright (c) 2021 Nippon Telegraph and Telephone corporation (NTT).
-# All rights reserved
-
 import os
 import numpy as np
 from functools import partial
@@ -14,12 +11,72 @@ from eend.pytorch_backend.diarization_dataset \
     import DiarizationDatasetFromWave, DiarizationDatasetFromFeat
 import padertorch as pt
 import padertorch.train.optimizer as pt_opt
+import yamlargparse
 
+parser = yamlargparse.ArgumentParser(description='training')
+parser.add_argument('-c', '--config', help='config file path',
+                    action=yamlargparse.ActionConfigFile)
+parser.add_argument('train_data_dir',
+                    help='kaldi-style data dir used for training.')
+parser.add_argument('valid_data_dir',
+                    help='kaldi-style data dir used for validation.')
+parser.add_argument('model_save_dir',
+                    help='output directory which model file will be saved in.')
+parser.add_argument('--initmodel', '-m', default='',
+                    help='Initialize the model from given file')
+parser.add_argument('--spkv-lab', default='',
+                    help='file path of speaker vector with label and\
+                    speaker ID conversion table for adaptation')
+
+# The following arguments are set in conf/train.yaml or conf/adapt.yaml
+parser.add_argument('--spk-loss-ratio', default=0.03, type=float)
+parser.add_argument('--spkv-dim', default=256, type=int,
+                    help='dimension of speaker embedding vector')
+parser.add_argument('--max-epochs', default=100, type=int,
+                    help='Max. number of epochs to train')
+parser.add_argument('--input-transform', default='logmel23_mn',
+                    choices=['', 'log', 'logmel', 'logmel23', 'logmel23_mn',
+                             'logmel23_mvn', 'logmel23_swn'],
+                    help='input transform')
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--optimizer', default='noam', type=str)
+parser.add_argument('--num-speakers', default=3, type=int)
+parser.add_argument('--gradclip', default=5, type=int,
+                    help='gradient clipping. if < 0, no clipping')
+parser.add_argument('--chunk-size', default=150, type=int,
+                    help='number of frames in one utterance')
+parser.add_argument('--batchsize', default=64, type=int,
+                    help='number of utterances in one batch.\
+                    Note that real batchsize = number of gpu *\
+                    batchsize-per-gpu * batchsize')
+parser.add_argument('--num-workers', default=8, type=int)
+parser.add_argument('--hidden-size', default=256, type=int)
+parser.add_argument('--context-size', default=7, type=int)
+parser.add_argument('--subsampling', default=10, type=int)
+parser.add_argument('--frame-size', default=200, type=int)
+parser.add_argument('--frame-shift', default=80, type=int)
+parser.add_argument('--sampling-rate', default=8000, type=int)
+parser.add_argument('--noam-scale', default=1.0, type=float)
+parser.add_argument('--noam-warmup-steps', default=25000, type=float)
+parser.add_argument('--transformer-encoder-n-heads', default=8, type=int)
+parser.add_argument('--transformer-encoder-n-layers', default=6, type=int)
+parser.add_argument('--transformer-encoder-dropout', default=0.1, type=float)
+parser.add_argument('--seed', default=777, type=int)
+parser.add_argument('--feature-nj', default=100, type=int,
+                    help='maximum number of subdirectories to store\
+                    featlab_XXXXXXXX.npy')
+parser.add_argument('--batchsize-per-gpu', default=16, type=int,
+                    help='virtual_minibatch_size in padertorch')
+parser.add_argument('--test-run', default=0, type=int, choices=[0, 1],
+                    help='padertorch test run switch; 1 is on, 0 is off')
+
+args = parser.parse_args()
+print(args)
 
 def collate_fn_ns(batch, n_speakers, spkidx_tbl):
-    xs, ts, ss, ns, ilens = list(zip(*batch))
+    xs, ts, ss, ns, ilens = list(zip(*batch)) # feature, activity, speaker ID, speaker number, chunksize
     valid_chunk_indices1 = [i for i in range(len(ts))
-                            if ts[i].shape[1] == n_speakers]
+                            if ts[i].shape[1] == n_speakers] # 3 == n_speakers
     valid_chunk_indices2 = []
 
     # n_speakers (rec-data) > n_speakers (model)
@@ -100,163 +157,6 @@ def collate_fn(batch):
 
     return (xs, ts, ss, ns, ilens)
 
-
-def train(args):
-    # Set seed for reproducibility
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    os.environ['PYTORCH_SEED'] = str(args.seed)
-    torch.backends.cudnn.benchmark = False
-
-    # Prepare data
-    featlab_chunk_indices_path =\
-        '{}/data/featlab_chunk_indices.txt'.format(args.model_save_dir)
-
-    featdim = get_input_dim(args.frame_size,
-                            args.context_size,
-                            args.input_transform)
-
-    train_set = DiarizationDatasetFromFeat(
-        featlab_chunk_indices_path,
-        featdim,
-        )
-    dev_set = DiarizationDatasetFromWave(
-        args.valid_data_dir,
-        chunk_size=args.chunk_size,
-        context_size=args.context_size,
-        input_transform=args.input_transform,
-        frame_size=args.frame_size,
-        frame_shift=args.frame_shift,
-        subsampling=args.subsampling,
-        rate=args.sampling_rate,
-        n_speakers=args.num_speakers,
-        )
-
-    # Prepare model
-    all_n_speakers = train_set.get_allnspk()
-    net = TransformerDiarization(
-            args.num_speakers,
-            featdim,
-            n_units=args.hidden_size,
-            n_heads=args.transformer_encoder_n_heads,
-            n_layers=args.transformer_encoder_n_layers,
-            dropout_rate=args.transformer_encoder_dropout,
-            all_n_speakers=all_n_speakers,
-            d=args.spkv_dim)
-
-    if args.initmodel:
-        # adaptation
-        model_parameter_dict = torch.load(args.initmodel)['model']
-        fix_model_parameter_dict = fix_state_dict(model_parameter_dict)
-        all_n_speakers = fix_model_parameter_dict["embed.weight"].shape[0]
-
-        print("old all_n_speakers : {}".format(all_n_speakers))
-        net = TransformerDiarization(
-                args.num_speakers,
-                featdim,
-                n_units=args.hidden_size,
-                n_heads=args.transformer_encoder_n_heads,
-                n_layers=args.transformer_encoder_n_layers,
-                dropout_rate=args.transformer_encoder_dropout,
-                all_n_speakers=all_n_speakers,
-                d=args.spkv_dim)
-        net.load_state_dict(fix_model_parameter_dict)
-        npz = np.load(args.spkv_lab)
-        spkvecs = npz['arr_0']
-        spklabs = npz['arr_1']
-        spkidx_tbl = npz['arr_2']
-
-        # init
-        spk_num = len(np.unique(spklabs))
-        fet_dim = spkvecs.shape[1]
-        fet_arr = np.zeros([spk_num, fet_dim])
-
-        # sum
-        bs = spklabs.shape[0]
-        for i in range(bs):
-            if spkidx_tbl[spklabs[i]] == -1:
-                raise ValueError(spklabs[i])
-            fet_arr[spkidx_tbl[spklabs[i]]] += spkvecs[i]
-
-        # normalize
-        for spk in range(spk_num):
-            org = fet_arr[spk]
-            norm = np.linalg.norm(org, ord=2)
-            fet_arr[spk] = org / norm
-
-        weight = torch.from_numpy(fet_arr.astype(np.float32)).clone()
-        print("new all_n_speakers : {}".format(weight.shape[0]))
-
-        print(net)
-        net.modfy_emb(weight)
-        print(net)
-
-    # device = [device_id for device_id in range(torch.cuda.device_count())]
-    device = [1]
-    model = PadertorchModel(net=net)
-    print('GPU device {} is used'.format(device))
-    print('Prepared model.')
-
-    # Setup optimizer
-    if args.optimizer == 'adam':
-        optimizer = pt_opt.Adam(lr=args.lr, gradient_clipping=args.gradclip)
-    elif args.optimizer == 'sgd':
-        optimizer = pt_opt.SGD(lr=args.lr, gradient_clipping=args.gradclip)
-    elif args.optimizer == 'noam':
-        optimizer = pt_opt.Adam(lr=args.lr, betas=(0.9, 0.98), eps=1e-9,
-                                gradient_clipping=args.gradclip)
-    else:
-        raise ValueError(args.optimizer)
-
-    trainloader = torch.utils.data.DataLoader(train_set,
-                                              batch_size=args.batchsize,
-                                              shuffle=False,
-                                              num_workers=args.num_workers)
-
-    # pit_loss_ratio means diarization loss ratio
-    pit_loss_ratio = abs(1 - args.spk_loss_ratio)
-    spk_loss_ratio = args.spk_loss_ratio
-    virtual_minibatch_size = len(device) * args.batchsize_per_gpu
-
-    trainer = pt.trainer.Trainer(
-            model,
-            args.model_save_dir,
-            optimizer,
-            stop_trigger=(args.max_epochs, 'epoch'),
-            summary_trigger=(1, 'iteration'),
-            virtual_minibatch_size=virtual_minibatch_size,
-            loss_weights={
-              "pit_loss": pit_loss_ratio,
-              "spk_loss": spk_loss_ratio,
-              }
-            )
-
-    devloader = torch.utils.data.DataLoader(dev_set, batch_size=args.batchsize,
-                                            shuffle=False,
-                                            num_workers=args.num_workers,
-                                            collate_fn=collate_fn)
-    if args.test_run == 1:
-        trainer.test_run(trainloader, devloader)
-
-    trainer.register_validation_hook(validation_iterator=devloader,
-                                     max_checkpoints=args.max_epochs+1)
-
-    # learning rate scheduler
-    if args.optimizer == 'noam':
-        scheduler = NoamScheduler(trainer.optimizer.optimizer,
-                                  args.hidden_size,
-                                  warmup_steps=args.noam_warmup_steps,
-                                  tot_step=len(trainloader),
-                                  scale=1.0)
-        trainer.register_hook(
-            pt.train.hooks.LRSchedulerHook(scheduler, trigger=(1, 'iteration'))
-            )
-
-    trainer.train(trainloader, resume=False, device=device)
-    print('Finished!')
-
-
 def save_feature(args):
     # Set seed for reproducibility
     np.random.seed(args.seed)
@@ -297,6 +197,29 @@ def save_feature(args):
             )
     n_chunks = len(trainloader)
     print("n_chunks : {}".format(n_chunks))
+    idx = 0
+    for data in trainloader:
+        dir_num = idx // max_num_per_dir
+        os.makedirs("{}/data/{:0={}}/".
+                    format(args.model_save_dir, dir_num, digit_num),
+                    exist_ok=True)
+        output_npy_path = fmt.format(args.model_save_dir,
+                                     dir_num, digit_num, idx)
+        print(output_npy_path)
+        bs = data[0].shape[0] #batch size
+        cs = data[0].shape[1] #chunk size
+        # data0 (feature)
+        data0 = data[0]
+        # data1 (reference speech activity)
+        data1 = data[1]
+        # data2 (reference speaker ID)
+        data2 = np.zeros([bs, cs, data[2].shape[1]], dtype=np.float32)
+        for j in range(bs):
+            data2[j, :, :] = data[2][j, :]
+        # data3 (reference number of all speakers)
+        data3 = np.ones([bs, cs, 1], dtype=np.float32) * len(data[3][0])
+        # data4 (real chunk size)
+        data4 = np.zeros([bs, cs, 1], dtype=np.float32)
     os.makedirs("{}/data/".format(args.model_save_dir), exist_ok=True)
     f = open('{}/data/n_chunks.txt'.format(args.model_save_dir), 'w')
     f.write("{}\n".format(n_chunks))
@@ -337,8 +260,8 @@ def save_feature(args):
         output_npy_path = fmt.format(args.model_save_dir,
                                      dir_num, digit_num, idx)
         print(output_npy_path)
-        bs = data[0].shape[0]
-        cs = data[0].shape[1]
+        bs = data[0].shape[0] #batch size
+        cs = data[0].shape[1] #chunk size
         # data0 (feature)
         data0 = data[0]
         # data1 (reference speech activity)
@@ -370,3 +293,12 @@ def save_feature(args):
     f.write("")
     f.close()
     print('Finished!')
+
+save_feature(args)
+
+def set_field_chunk_idx(ref):
+    field_idx_list = [0]
+    for i in range(len(ref)-1):
+        if ref[i + 1] != ref[i]:
+            field_idx_list.append(i + 1)
+    return field_idx_list
